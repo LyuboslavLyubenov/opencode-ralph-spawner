@@ -15,7 +15,7 @@
  *   node ralph.js --retry  — force retry onboarding (same as auto-detect when previous run exists)
  *
  * Requires:
- *   - OpenCode server running at http://localhost:4096
+ *   - `opencode` binary available in PATH (server is spawned automatically on a free port)
  *   - ralph/goals.md, ralph/impl-criteria.md, ralph/verify-criteria.md already written
  *     (the invoking agent writes these before calling this script)
  */
@@ -26,6 +26,7 @@ import { join, dirname, resolve } from "path";
 import { fileURLToPath } from "url";
 import { createInterface } from "readline";
 import { spawn } from "child_process";
+import { createServer } from "net";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -151,44 +152,147 @@ async function askConfirm(prompt) {
 }
 
 // ---------------------------------------------------------------------------
+// OpenCode server management
+// ---------------------------------------------------------------------------
+
+/** Find a free TCP port by binding to :0 and immediately releasing it. */
+function getFreePort() {
+  return new Promise((resolve, reject) => {
+    const srv = createServer();
+    srv.listen(0, "127.0.0.1", () => {
+      const port = srv.address().port;
+      srv.close(() => resolve(port));
+    });
+    srv.on("error", reject);
+  });
+}
+
+/**
+ * Spawn `opencode serve --port <port>` as a child process.
+ * Returns { process, port, baseUrl }.
+ * Throws if the server doesn't become reachable within 30 s.
+ */
+async function spawnOpencodeServer() {
+  const port = await getFreePort();
+  const baseUrl = `http://localhost:${port}`;
+
+  log(`Spawning OpenCode server on port ${port}...`, "cyan");
+
+  const srv = spawn("opencode", ["serve", "--port", String(port)], {
+    stdio: ["ignore", "pipe", "pipe"],
+    detached: false,
+  });
+
+  let serverOutput = "";
+
+  srv.stdout.on("data", (d) => {
+    serverOutput += d.toString();
+  });
+  srv.stderr.on("data", (d) => {
+    serverOutput += d.toString();
+  });
+
+  srv.on("error", (err) => {
+    log(`OpenCode server process error: ${err.message}`, "red");
+  });
+
+  // Poll until the server responds to session.list() or timeout
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    await sleep(500);
+    try {
+      const testClient = createOpencodeClient({ baseUrl });
+      await testClient.session.list();
+      log(`OpenCode server ready at ${baseUrl}`, "green");
+      return { process: srv, port, baseUrl };
+    } catch {
+      // not ready yet
+    }
+  }
+
+  // Timed out — kill and surface the output for debugging
+  srv.kill();
+  throw new Error(
+    `OpenCode server did not become ready within 30 s.\nOutput:\n${serverOutput}`,
+  );
+}
+
+/** Gracefully stop the server process. */
+function stopOpencodeServer(srv) {
+  if (!srv || srv.killed) return;
+  try {
+    srv.kill("SIGTERM");
+    log("OpenCode server stopped.", "dim");
+  } catch {
+    // ignore
+  }
+}
+
+// ---------------------------------------------------------------------------
 // OpenCode SDK — session helpers
 // ---------------------------------------------------------------------------
 
-async function waitForIdle(client, sessionId, timeoutMs = SESSION_TIMEOUT_MS) {
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function waitForIdle(client, sessionId, timeoutMs = SESSION_TIMEOUT_MS, directory = null) {
   const start = Date.now();
   let seenBusy = false;
+  let seenSession = false; // track whether we've ever seen this session in the status map
+  let consecutiveIdle = 0;
+  // After seeing busy at least once, require 2 consecutive idle polls to confirm completion
+  // (guards against false idle between tool calls).
+  // If we never see busy (session completed before first poll), 3 consecutive idles confirms
+  // it finished fast rather than never started.
+  const IDLE_CONFIRMATIONS_AFTER_BUSY = 2;
+  const IDLE_CONFIRMATIONS_NEVER_BUSY = 3;
 
   while (Date.now() - start < timeoutMs) {
     await sleep(POLL_INTERVAL_MS);
-    const statuses = await client.session.status();
-    const s = statuses.data?.[sessionId] ?? statuses[sessionId];
+    // The status API only returns sessions associated with the given directory.
+    // Always poll both with and without directory so we never miss a session.
+    const [s1, s2] = await Promise.all([
+      client.session.status(directory ? { query: { directory } } : undefined)
+        .then(r => r.data?.[sessionId] ?? r[sessionId])
+        .catch(() => undefined),
+      directory
+        ? client.session.status().then(r => r.data?.[sessionId] ?? r[sessionId]).catch(() => undefined)
+        : Promise.resolve(undefined),
+    ]);
+    const s = s1 ?? s2;
 
     if (!s) {
-      // Session entry is gone from the status map — completed (possibly before first poll)
-      return true;
+      if (seenSession) {
+        // Session was present before but is now gone — it completed and was evicted
+        return true;
+      }
+      // Session not yet registered — it's still starting up, keep waiting
+      consecutiveIdle = 0;
+      continue;
     }
 
+    seenSession = true;
     const type = s.type;
 
     if (type !== "idle") {
       seenBusy = true;
+      consecutiveIdle = 0;
       if (type === "retry") {
         log(`Session retrying (attempt ${s.attempt}): ${s.message}`, "yellow");
       }
     } else {
       // type === "idle"
-      if (seenBusy) {
-        // Was busy, now idle — done
+      consecutiveIdle++;
+      const needed = seenBusy ? IDLE_CONFIRMATIONS_AFTER_BUSY : IDLE_CONFIRMATIONS_NEVER_BUSY;
+      if (consecutiveIdle >= needed) {
+        // Confirmed idle across multiple polls — the agent has truly finished
         return true;
       }
-      // Still idle and never seen busy — session is starting up, keep waiting
+      // Not enough consecutive idles yet — either between tool calls, or still starting up
     }
   }
   throw new Error(`Session ${sessionId} timed out after ${timeoutMs / 1000}s`);
-}
-
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
 }
 
 /**
@@ -215,22 +319,129 @@ async function getLastAssistantMessage(client, sessionId) {
   return null;
 }
 
+
+// ---------------------------------------------------------------------------
+// Live streaming — poll messages and print new content as it arrives
+// ---------------------------------------------------------------------------
+
 /**
- * Get ALL messages from a session as a printable log.
+ * Wait for a session to complete while printing live output to the console.
+ * Returns the final assistant message text.
+ *
+ * Completion is detected via `step-finish` parts in the messages API — this is the only
+ * reliable signal. The status() API is unreliable: when a prompt is sent with a `directory`,
+ * the server scopes status results and the session never appears in status() at all, meaning
+ * status-based polling loops forever. Messages are always available regardless of directory.
+ *
+ * Each LLM step emits: step-start → [tool-invocations / text] → step-finish
+ * When the model calls a tool, the result spawns a NEW assistant message for the next step.
+ * So "truly done" = latest assistant message has step-finish AND no unresolved tool calls.
  */
-async function getAllMessages(client, sessionId) {
-  try {
-    const resp = await client.session.messages({ path: { id: sessionId } });
-    const messages = resp?.data ?? resp;
-    if (!messages || !Array.isArray(messages)) return [];
-    return messages;
-  } catch {
-    return [];
+async function streamUntilIdle(client, sessionId, timeoutMs = SESSION_TIMEOUT_MS, directory = null) {
+  const start = Date.now();
+
+  // --- streaming state ---
+  const announcedTools = new Map(); // tracks printed chars per text part and announced tool calls
+  let streamingStarted = false;
+
+  process.stdout.write(c("dim", "  "));
+
+  while (Date.now() - start < timeoutMs) {
+    await sleep(POLL_INTERVAL_MS);
+
+    // --- poll messages — primary completion signal AND live streaming ---
+    try {
+      const resp = await client.session.messages({ path: { id: sessionId } });
+      const messages = resp?.data ?? resp;
+      if (!messages || !Array.isArray(messages)) continue;
+
+      // Find index of the latest assistant message
+      let lastAssistantIdx = -1;
+      for (let mi = 0; mi < messages.length; mi++) {
+        if (messages[mi].parts?.some((p) => p.type === "step-start")) {
+          lastAssistantIdx = mi;
+        }
+      }
+
+      // Stream live output for all assistant messages
+      for (let mi = 0; mi < messages.length; mi++) {
+        const msg = messages[mi];
+        const parts = msg.parts || [];
+        const isAssistant = parts.some((p) => p.type === "step-start");
+        if (!isAssistant) continue;
+
+        for (let pi = 0; pi < parts.length; pi++) {
+          const part = parts[pi];
+          const partKey = `${mi}:${pi}`;
+
+          if (part.type === "text" && part.text) {
+            const text = part.text;
+            const alreadyPrinted = announcedTools.get(partKey) ?? 0;
+            if (text.length > alreadyPrinted) {
+              const newChars = text.slice(alreadyPrinted);
+              if (!streamingStarted) {
+                process.stdout.write("\n");
+                streamingStarted = true;
+              }
+              process.stdout.write(c("white", newChars));
+              announcedTools.set(partKey, text.length);
+            }
+          } else if (part.type === "tool-invocation" || part.type === "tool") {
+            // API uses type "tool" with state.status; older shape used "tool-invocation"
+            const toolName = part.tool ?? part.toolInvocation?.toolName ?? part.name ?? "tool";
+            const status = part.state?.status ?? part.toolInvocation?.state ?? part.state ?? "";
+            const input = part.state?.input ?? part.toolInvocation?.args ?? part.args ?? {};
+            const argSummary = JSON.stringify(input).slice(0, 60);
+            const key = `tool:${partKey}:${status}:${argSummary}`;
+
+            if (!announcedTools.has(key)) {
+              announcedTools.set(key, true);
+              if (streamingStarted) process.stdout.write("\n");
+              const stateLabel =
+                (status === "completed" || status === "result") ? c("green", "done") :
+                (status === "running"   || status === "call")   ? c("cyan", "running") :
+                c("dim", status || "...");
+              const toolLabel = `  [${c("cyan", toolName)} ${stateLabel}]`;
+
+              let hint = "";
+              if (input.command)  hint = ` ${String(input.command).slice(0, 60)}`;
+              else if (input.filePath) hint = ` ${String(input.filePath).slice(0, 60)}`;
+              else if (input.pattern)  hint = ` ${String(input.pattern).slice(0, 60)}`;
+              else if (input.query)    hint = ` ${String(input.query).slice(0, 60)}`;
+
+              console.log(toolLabel + c("dim", hint));
+              streamingStarted = false;
+            }
+          }
+        }
+      }
+
+      // Completion: latest assistant message has step-finish with reason "stop".
+      // reason "tool-calls" means this step ended because the model called tools —
+      // the agent loop will continue with a new assistant message after the tool results.
+      // reason "stop" means the model finished its response with no further tool calls.
+      if (lastAssistantIdx >= 0) {
+        const lastParts = messages[lastAssistantIdx].parts || [];
+        const stepFinish = lastParts.find((p) => p.type === "step-finish");
+        if (stepFinish && stepFinish.reason === "stop") {
+          if (streamingStarted) process.stdout.write("\n");
+          break;
+        }
+      }
+    } catch {
+      // message fetch hiccup — keep going
+    }
   }
+
+  if (Date.now() - start >= timeoutMs) {
+    throw new Error(`Session ${sessionId} timed out after ${timeoutMs / 1000}s`);
+  }
+
+  return await getLastAssistantMessage(client, sessionId);
 }
 
 /**
- * Send a message to a session and wait for the response.
+ * Send a message to a session and stream the response live.
  * Returns the assistant's response text.
  */
 async function sendMessage(client, sessionId, text, directory) {
@@ -242,12 +453,11 @@ async function sendMessage(client, sessionId, text, directory) {
     },
   });
 
-  await waitForIdle(client, sessionId);
-  return await getLastAssistantMessage(client, sessionId);
+  return await streamUntilIdle(client, sessionId, SESSION_TIMEOUT_MS, directory);
 }
 
 /**
- * Create a new session and send an initial prompt.
+ * Create a new session and send an initial prompt, streaming output live.
  * Returns { sessionId, firstResponse }.
  */
 async function createSessionWithPrompt(client, { title, systemPrompt, userPrompt, directory }) {
@@ -266,8 +476,7 @@ async function createSessionWithPrompt(client, { title, systemPrompt, userPrompt
     },
   });
 
-  await waitForIdle(client, sessionId);
-  const response = await getLastAssistantMessage(client, sessionId);
+  const response = await streamUntilIdle(client, sessionId, SESSION_TIMEOUT_MS, directory);
 
   return { sessionId, firstResponse: response };
 }
@@ -693,6 +902,7 @@ Output RALPH_PLAN_COMPLETE when done.
         console.log(c("magenta", "\n[Planner]"));
         console.log(revResponse);
         console.log();
+        // Check for completion signal
         if (revResponse.includes("RALPH_PLAN_COMPLETE")) {
           revPlanComplete = true;
           log("Planner has completed the plan.", "green");
@@ -799,53 +1009,36 @@ If blocked, output RALPH_TASK_BLOCKED: ${task.id} — [reason].
         directory: PROJECT_DIR,
       });
 
-      log(`Session ${sessionId} running...`, "dim");
-
+      // createSessionWithPrompt already streamed output and returned the final response.
+      // Check the completion signal; if missing, nudge the agent and wait again.
       let response = firstResponse;
-      let taskDone = false;
-      let taskBlocked = false;
+      let taskDone = response?.includes(`RALPH_TASK_COMPLETE: ${task.id}`) ?? false;
+      let taskBlocked = response?.includes(`RALPH_TASK_BLOCKED: ${task.id}`) ?? false;
       let blockReason = "";
-      let lastChangeAt = Date.now();
-      let nudgeCount = 0;
-      const STALL_TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes with no new message
-      const MAX_NUDGES = 2;
 
-      // Wait for completion signal by polling last message
-      while (!taskDone && !taskBlocked) {
-        await sleep(POLL_INTERVAL_MS);
-        const latest = await getLastAssistantMessage(client, sessionId);
-
-        if (latest && latest !== response) {
-          response = latest;
-          lastChangeAt = Date.now();
+      if (!taskDone && !taskBlocked) {
+        const MAX_NUDGES = 2;
+        for (let nudge = 1; nudge <= MAX_NUDGES && !taskDone && !taskBlocked; nudge++) {
+          log(`Task ${task.id}: no signal yet — nudge ${nudge}/${MAX_NUDGES}.`, "yellow");
+          response = await sendMessage(
+            client,
+            sessionId,
+            `Have you completed task ${task.id}? If so output RALPH_TASK_COMPLETE: ${task.id} now. If blocked, output RALPH_TASK_BLOCKED: ${task.id} — [reason].`,
+            PROJECT_DIR
+          );
+          taskDone = response?.includes(`RALPH_TASK_COMPLETE: ${task.id}`) ?? false;
+          taskBlocked = response?.includes(`RALPH_TASK_BLOCKED: ${task.id}`) ?? false;
         }
-
-        if (!response) continue;
-
-        if (response.includes(`RALPH_TASK_COMPLETE: ${task.id}`)) {
-          taskDone = true;
-        } else if (response.includes(`RALPH_TASK_BLOCKED: ${task.id}`)) {
+        if (!taskDone && !taskBlocked) {
+          log(`Task ${task.id}: still no signal after nudges — marking blocked.`, "yellow");
           taskBlocked = true;
-          const match = response.match(/RALPH_TASK_BLOCKED: .+? — (.+)/);
-          blockReason = match ? match[1] : "Unknown reason";
-        } else if (Date.now() - lastChangeAt > STALL_TIMEOUT_MS) {
-          if (nudgeCount >= MAX_NUDGES) {
-            log(`Task ${task.id}: no signal after ${MAX_NUDGES} nudges, marking blocked.`, "yellow");
-            taskBlocked = true;
-            blockReason = `No completion signal after ${MAX_NUDGES} nudges`;
-          } else {
-            nudgeCount++;
-            log(`Task ${task.id}: stalled for 3 min, sending nudge ${nudgeCount}/${MAX_NUDGES}.`, "yellow");
-            // sendMessage calls waitForIdle internally — response will be updated on next poll
-            sendMessage(
-              client,
-              sessionId,
-              `Have you completed task ${task.id}? If so output RALPH_TASK_COMPLETE: ${task.id} now. If blocked, output RALPH_TASK_BLOCKED: ${task.id} — [reason].`,
-              PROJECT_DIR
-            ).catch(() => {}); // fire-and-forget — polling loop will pick up the response
-            lastChangeAt = Date.now(); // reset timer so we wait another 3 min before next nudge
-          }
+          blockReason = `No completion signal after nudges`;
         }
+      }
+
+      if (taskBlocked && !blockReason) {
+        const match = (response || "").match(/RALPH_TASK_BLOCKED: .+? — (.+)/);
+        blockReason = match ? match[1] : "Unknown reason";
       }
 
       // Log output
@@ -948,54 +1141,34 @@ End with RALPH_VERIFY_PASS or RALPH_VERIFY_FAIL: [N] failures found.
     directory: PROJECT_DIR,
   });
 
-  log(`Verifier session ${sessionId} running...`, "dim");
-
+  // createSessionWithPrompt already streamed output. Check for signal; nudge if missing.
   let response = firstResponse;
-  let verifyDone = false;
-  let verifyPassed = false;
+  let verifyPassed = response?.includes("RALPH_VERIFY_PASS") ?? false;
+  let verifyFailed = response?.includes("RALPH_VERIFY_FAIL") ?? false;
   let failureCount = 0;
-  let lastChangeAt = Date.now();
-  let nudgeCount = 0;
-  const STALL_TIMEOUT_MS = 3 * 60 * 1000;
-  const MAX_NUDGES = 2;
 
-  while (!verifyDone) {
-    await sleep(POLL_INTERVAL_MS);
-    const latest = await getLastAssistantMessage(client, sessionId);
-
-    if (latest && latest !== response) {
-      response = latest;
-      lastChangeAt = Date.now();
+  if (!verifyPassed && !verifyFailed) {
+    const MAX_NUDGES = 2;
+    for (let nudge = 1; nudge <= MAX_NUDGES && !verifyPassed && !verifyFailed; nudge++) {
+      log(`Verifier: no signal yet — nudge ${nudge}/${MAX_NUDGES}.`, "yellow");
+      response = await sendMessage(
+        client,
+        sessionId,
+        "Please finalize your verification report at ralph/verification-report.md, then output RALPH_VERIFY_PASS or RALPH_VERIFY_FAIL: [N] failures found.",
+        PROJECT_DIR
+      );
+      verifyPassed = response?.includes("RALPH_VERIFY_PASS") ?? false;
+      verifyFailed = response?.includes("RALPH_VERIFY_FAIL") ?? false;
     }
-
-    if (!response) continue;
-
-    if (response.includes("RALPH_VERIFY_PASS")) {
-      verifyDone = true;
-      verifyPassed = true;
-    } else if (response.includes("RALPH_VERIFY_FAIL")) {
-      verifyDone = true;
-      verifyPassed = false;
-      const match = response.match(/RALPH_VERIFY_FAIL: (\d+)/);
-      failureCount = match ? parseInt(match[1]) : 1;
-    } else if (Date.now() - lastChangeAt > STALL_TIMEOUT_MS) {
-      if (nudgeCount >= MAX_NUDGES) {
-        log("Verifier: no signal after nudges, treating as failure.", "yellow");
-        verifyDone = true;
-        verifyPassed = false;
-        failureCount = 1;
-      } else {
-        nudgeCount++;
-        log(`Verifier stalled, sending nudge ${nudgeCount}/${MAX_NUDGES}.`, "yellow");
-        sendMessage(
-          client,
-          sessionId,
-          "Please finalize your verification report at ralph/verification-report.md, then output RALPH_VERIFY_PASS or RALPH_VERIFY_FAIL: [N] failures found.",
-          PROJECT_DIR
-        ).catch(() => {});
-        lastChangeAt = Date.now();
-      }
+    if (!verifyPassed && !verifyFailed) {
+      log("Verifier: no signal after nudges, treating as failure.", "yellow");
+      verifyFailed = true;
     }
+  }
+
+  if (verifyFailed) {
+    const match = (response || "").match(/RALPH_VERIFY_FAIL: (\d+)/);
+    failureCount = match ? parseInt(match[1]) : 1;
   }
 
   logToFile(`verify-cycle-${state.currentCycle}.log`, response || "");
@@ -1137,44 +1310,27 @@ If still blocked, output RALPH_TASK_BLOCKED: ${task.id} — [reason].
         directory: PROJECT_DIR,
       });
 
+      // createSessionWithPrompt already streamed output. Check signal; nudge if missing.
       let response = firstResponse;
-      let done = false;
-      let blocked = false;
-      let lastChangeAt = Date.now();
-      let nudgeCount = 0;
-      const STALL_TIMEOUT_MS = 3 * 60 * 1000;
-      const MAX_NUDGES = 2;
+      let done = response?.includes(`RALPH_TASK_COMPLETE: ${task.id}`) ?? false;
+      let blocked = response?.includes(`RALPH_TASK_BLOCKED: ${task.id}`) ?? false;
 
-      while (!done && !blocked) {
-        await sleep(POLL_INTERVAL_MS);
-        const latest = await getLastAssistantMessage(client, sessionId);
-
-        if (latest && latest !== response) {
-          response = latest;
-          lastChangeAt = Date.now();
+      if (!done && !blocked) {
+        const MAX_NUDGES = 2;
+        for (let nudge = 1; nudge <= MAX_NUDGES && !done && !blocked; nudge++) {
+          log(`Heal ${task.id}: no signal yet — nudge ${nudge}/${MAX_NUDGES}.`, "yellow");
+          response = await sendMessage(
+            client,
+            sessionId,
+            `Have you finished fixing task ${task.id}? Output RALPH_TASK_COMPLETE: ${task.id} or RALPH_TASK_BLOCKED: ${task.id} — [reason].`,
+            PROJECT_DIR
+          );
+          done = response?.includes(`RALPH_TASK_COMPLETE: ${task.id}`) ?? false;
+          blocked = response?.includes(`RALPH_TASK_BLOCKED: ${task.id}`) ?? false;
         }
-
-        if (!response) continue;
-
-        if (response.includes(`RALPH_TASK_COMPLETE: ${task.id}`)) {
-          done = true;
-        } else if (response.includes(`RALPH_TASK_BLOCKED: ${task.id}`)) {
+        if (!done && !blocked) {
+          log(`Heal ${task.id}: no signal after nudges — marking blocked.`, "yellow");
           blocked = true;
-        } else if (Date.now() - lastChangeAt > STALL_TIMEOUT_MS) {
-          if (nudgeCount >= MAX_NUDGES) {
-            log(`Heal ${task.id}: no signal after ${MAX_NUDGES} nudges, marking blocked.`, "yellow");
-            blocked = true;
-          } else {
-            nudgeCount++;
-            log(`Heal ${task.id}: stalled, sending nudge ${nudgeCount}/${MAX_NUDGES}.`, "yellow");
-            sendMessage(
-              client,
-              sessionId,
-              `Have you finished fixing task ${task.id}? Output RALPH_TASK_COMPLETE: ${task.id} or RALPH_TASK_BLOCKED: ${task.id} — [reason].`,
-              PROJECT_DIR
-            ).catch(() => {});
-            lastChangeAt = Date.now();
-          }
         }
       }
 
@@ -1476,86 +1632,33 @@ async function main() {
   // Ensure logs dir exists
   if (!existsSync(PATHS.logs)) mkdirSync(PATHS.logs, { recursive: true });
 
-  // Init client (auto-start server if needed)
-  let client;
-  let serverProcess = null;
+  // Spawn OpenCode server
+  let opencodeServer;
   try {
-    client = createOpencodeClient({ baseUrl: "http://localhost:4096" });
-    await client.session.list();
-    log("Connected to OpenCode server.", "green");
+    opencodeServer = await spawnOpencodeServer();
   } catch (err) {
-    log("OpenCode server not running. Starting it automatically...", "yellow");
-    log(`Error was: ${err.message}`, "dim");
-
-    serverProcess = spawn("opencode", ["serve"], {
-      cwd: PROJECT_DIR,
-      detached: false,
-      stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env },
-    });
-
-    const serverStartupLog = [];
-    serverProcess.stdout.on("data", (d) => {
-      const line = d.toString().trim();
-      if (line) serverStartupLog.push(line);
-    });
-    serverProcess.stderr.on("data", (d) => {
-      const line = d.toString().trim();
-      if (line) serverStartupLog.push(line);
-    });
-
-    serverProcess.on("error", (e) => {
-      log(`Failed to start opencode serve: ${e.message}`, "red");
-      process.exit(1);
-    });
-    serverProcess.on("exit", (code) => {
-      if (code && code !== 0) {
-        log(`opencode serve exited with code ${code}`, "red");
-      }
-    });
-
-    const SERVER_START_TIMEOUT = 60_000;
-    const POLL = 1000;
-    const start = Date.now();
-    let connected = false;
-
-    while (Date.now() - start < SERVER_START_TIMEOUT) {
-      await sleep(POLL);
-      try {
-        client = createOpencodeClient({ baseUrl: "http://localhost:4096" });
-        await client.session.list();
-        connected = true;
-        break;
-      } catch {
-        process.stdout.write(".");
-      }
-    }
-    console.log();
-
-    if (!connected) {
-      log("Failed to connect after starting opencode serve.", "red");
-      log("Server log:", "dim");
-      serverStartupLog.slice(-20).forEach((l) => console.log(c("dim", `  ${l}`)));
-      log("\nTry running manually: opencode serve", "yellow");
-      process.exit(1);
-    }
-
-    log("OpenCode server started and connected.", "green");
-    log("Press Ctrl+C to stop. The server will be cleaned up on exit.", "dim");
-
-    process.on("SIGINT", () => {
-      log("\nShutting down...", "yellow");
-      if (serverProcess && !serverProcess.killed) {
-        serverProcess.kill("SIGTERM");
-      }
-      process.exit(130);
-    });
-    process.on("exit", () => {
-      if (serverProcess && !serverProcess.killed) {
-        serverProcess.kill("SIGTERM");
-      }
-    });
+    log(`Failed to spawn OpenCode server: ${err.message}`, "red");
+    log(
+      "Make sure the `opencode` binary is in your PATH and supports `opencode serve --port <n>`.",
+      "yellow",
+    );
+    process.exit(1);
   }
+
+  // Ensure server is killed when ralph exits for any reason
+  const cleanup = () => stopOpencodeServer(opencodeServer?.process);
+  process.on("exit", cleanup);
+  process.on("SIGINT", () => {
+    cleanup();
+    process.exit(130);
+  });
+  process.on("SIGTERM", () => {
+    cleanup();
+    process.exit(143);
+  });
+
+  // Init client pointing at the spawned server
+  const client = createOpencodeClient({ baseUrl: opencodeServer.baseUrl });
 
   // Load or initialize state
   let state = loadState();
@@ -1574,7 +1677,19 @@ async function main() {
   } else if (verifyOnly) {
     state.phase = "verify";
     state.currentCycle = (state.currentCycle || 1);
-  } else if (!resumeMode) {
+  } else if (resumeMode) {
+    // --resume: honour saved phase, BUT if phase is still "plan" and plan files already
+    // exist and tasks are present, skip the interactive plan phase and go straight to
+    // implement — the plan was already written (e.g. by an external agent) and we must
+    // not block waiting for stdin Q&A.
+    const planExists = existsSync(PATHS.plan) && safeRead(PATHS.plan).trim().length > 0;
+    const tasksExist = Array.isArray(existingTasks) && existingTasks.length > 0;
+    if (state.phase === "plan" && planExists && tasksExist) {
+      log("plan.md and tasks.json already exist — skipping interactive plan phase.", "yellow");
+      state.phase = "implement";
+      saveState(state);
+    }
+  } else {
     // Fresh run — reset state
     state = {
       phase: "plan",
@@ -1610,6 +1725,7 @@ async function main() {
           const canContinue = await runHealPhase(client, state);
           if (!canContinue) {
             // Max cycles reached
+            cleanup();
             printFinalReport(false, state);
             process.exit(1);
           }
@@ -1627,6 +1743,7 @@ async function main() {
   }
 
   printFinalReport(true, state);
+  cleanup();
 }
 
 main().catch((err) => {
