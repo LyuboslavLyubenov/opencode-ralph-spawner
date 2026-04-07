@@ -422,6 +422,22 @@ async function streamUntilIdle(client, sessionId, timeoutMs = SESSION_TIMEOUT_MS
       // reason "stop" means the model finished its response with no further tool calls.
       if (lastAssistantIdx >= 0) {
         const lastParts = messages[lastAssistantIdx].parts || [];
+        
+        // Check if there's a pending question tool (waiting for user response)
+        // A question tool that hasn't been answered yet means we should NOT treat the session as complete
+        const hasPendingQuestion = lastParts.some((p) => 
+          (p.type === "tool" || p.type === "tool-invocation") && 
+          (p.tool === "question" || p.toolInvocation?.toolName === "question") &&
+          (!p.state?.result || !p.state?.status || p.state?.status === "running" || p.state?.status === "call")
+        );
+        
+        if (hasPendingQuestion) {
+          // Session is waiting for user input - but don't return early!
+          // The Q&A loop will detect this and prompt the user for input
+          // Just continue polling so the question stays displayed
+          continue;
+        }
+        
         const stepFinish = lastParts.find((p) => p.type === "step-finish");
         if (stepFinish && stepFinish.reason === "stop") {
           if (streamingStarted) process.stdout.write("\n");
@@ -488,7 +504,7 @@ async function createSessionWithPrompt(client, { title, systemPrompt, userPrompt
 const PROMPTS = {
   planner: `# RALPH Loop — Planner Agent
 
-You are the RALPH Planner. Your job is to deeply research the task at hand, ask clarifying questions, and produce a precise, actionable implementation plan.
+You are the RALPH Planner. Your job is to deeply research the task at hand and produce a precise, actionable implementation plan.
 
 ## Your Inputs
 
@@ -504,24 +520,16 @@ You will be given:
 
 1. Read \`goals.md\`, \`impl-criteria.md\`, and \`verify-criteria.md\` completely.
 2. Explore the codebase thoroughly:
-   - Understand the existing architecture, patterns, and conventions
-   - Find all files that will be touched by this work
-   - Identify dependencies, constraints, and potential conflicts
-   - Run any relevant commands to understand the current state (e.g., tests, builds)
+    - Understand the existing architecture, patterns, and conventions
+    - Find all files that will be touched by this work
+    - Identify dependencies, constraints, and potential conflicts
+    - Run any relevant commands to understand the current state (e.g., tests, builds)
 3. Search the web if you need knowledge about unfamiliar libraries, APIs, or patterns.
 4. Identify all ambiguities, risks, and unknowns.
 
-### Phase B — Clarification (interactive)
+### Phase B — Plan Production
 
-After research, if there are any unresolved questions, ask the user. Be specific:
-- Do not ask vague questions. Each question must be answerable with a short, specific answer.
-- Do not ask more than 5 questions at once.
-- Do not ask questions whose answers can be inferred from the codebase or goals.
-- After each answer, confirm your understanding before proceeding.
-
-End with: "I have enough information. Let me now produce the plan."
-
-### Phase C — Plan Production
+**IMPORTANT: DO NOT ASK ANY QUESTIONS. After your research is complete, immediately proceed to produce the plan without waiting for user input. Make reasonable assumptions based on the goals and codebase.**
 
 Write the plan to \`ralph/plan.md\`. The plan must contain:
 
@@ -529,11 +537,11 @@ Write the plan to \`ralph/plan.md\`. The plan must contain:
 2. **Architecture Decisions** — Key technical choices and why
 3. **Risk Register** — Potential blockers and mitigations
 4. **Task Breakdown** — Ordered list of atomic tasks. Each task must be:
-   - Small enough to be completed in a single fresh context window
-   - Self-contained (no hidden dependencies on other tasks in-flight)
-   - Unambiguous — a junior developer could implement it from the description alone
+    - Small enough to be completed in a single fresh context window
+    - Self-contained (no hidden dependencies on other tasks in-flight)
+    - Unambiguous — a junior developer could implement it from the description alone
 
-### Phase D — Tasks JSON
+### Phase C — Tasks JSON
 
 After writing \`plan.md\`, write the task list to \`ralph/tasks.json\`. Format:
 
@@ -556,7 +564,7 @@ After writing \`plan.md\`, write the task list to \`ralph/tasks.json\`. Format:
 
 Tasks must be ordered so that dependencies come first. The \`dependencies\` array contains task IDs that must be completed before this task.
 
-### Phase E — Handoff
+### Phase D — Handoff
 
 After writing \`plan.md\` and \`tasks.json\`, output EXACTLY this line and nothing else:
 
@@ -571,7 +579,7 @@ This signals to the orchestrator that the plan is ready for user review.
 - Be ruthlessly specific. Vague tasks produce broken code.
 - Each task description must be self-contained. Do NOT rely on "the previous task" — write out all context.
 - If a task requires touching more than 5 files, split it.
-- If you are uncertain about anything, ask before producing the plan.
+- **NEVER ask questions. Make reasonable assumptions and proceed.**
 - Do NOT start implementing. Your only output is \`plan.md\` and \`tasks.json\`.`,
 
   implementer: `# RALPH Loop — Implementer Agent
@@ -792,10 +800,14 @@ Signal completion with RALPH_PLAN_COMPLETE on its own line.
     if (!response) {
       log("No response from planner yet. Type 'done' to push it to finish, or wait.", "dim");
     } else {
-      // Print the planner's response
-      console.log(c("magenta", "\n[Planner]"));
-      console.log(response);
-      console.log();
+      // Print the planner's response (if not already printed during streaming)
+      const alreadyPrinted = response.includes("I've completed my research") || 
+                             response.includes("I've researched the codebase");
+      if (!alreadyPrinted) {
+        console.log(c("magenta", "\n[Planner]"));
+        console.log(response);
+        console.log();
+      }
 
       // Check for completion signal
       if (response.includes("RALPH_PLAN_COMPLETE")) {
