@@ -477,7 +477,11 @@ async function sendMessage(client, sessionId, text, directory) {
  * Returns { sessionId, firstResponse }.
  */
 async function createSessionWithPrompt(client, { title, systemPrompt, userPrompt, directory }) {
-  const session = await client.session.create({ body: { title } });
+  const session = await client.session.create({ 
+    body: { 
+      title,
+    } 
+  });
   const sessionId = session.id || session.data?.id;
   if (!sessionId) throw new Error("Failed to create session — no ID returned");
 
@@ -527,9 +531,17 @@ You will be given:
 3. Search the web if you need knowledge about unfamiliar libraries, APIs, or patterns.
 4. Identify all ambiguities, risks, and unknowns.
 
-### Phase B — Plan Production
+### Phase B — Clarification (interactive)
 
-**IMPORTANT: DO NOT ASK ANY QUESTIONS. After your research is complete, immediately proceed to produce the plan without waiting for user input. Make reasonable assumptions based on the goals and codebase.**
+After research, if there are any unresolved questions, ask the user. Be specific:
+- Do not ask vague questions. Each question must be answerable with a short, specific answer.
+- Do not ask more than 5 questions at once.
+- Do not ask questions whose answers can be inferred from the codebase or goals.
+- After each answer, confirm your understanding before proceeding.
+
+End with: "I have enough information. Let me now produce the plan."
+
+### Phase C — Plan Production
 
 Write the plan to \`ralph/plan.md\`. The plan must contain:
 
@@ -579,7 +591,7 @@ This signals to the orchestrator that the plan is ready for user review.
 - Be ruthlessly specific. Vague tasks produce broken code.
 - Each task description must be self-contained. Do NOT rely on "the previous task" — write out all context.
 - If a task requires touching more than 5 files, split it.
-- **NEVER ask questions. Make reasonable assumptions and proceed.**
+- If you are uncertain about anything, ask before producing the plan.
 - Do NOT start implementing. Your only output is \`plan.md\` and \`tasks.json\`.`,
 
   implementer: `# RALPH Loop — Implementer Agent

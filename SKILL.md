@@ -23,7 +23,7 @@ When asked to "run RALPH", "start the ralph loop", or "use ralph to build X", fo
 
 **Before doing anything else**, check whether a `ralph/` directory already exists in the current working directory AND contains a `tasks.json` with at least one entry.
 
-If it does, **skip Steps 1–4 entirely** and go straight to Step 5:
+If it does, **skip Steps 1–5 entirely** and go straight to Step 6:
 
 ```bash
 cd ralph && node ralph.js
@@ -39,7 +39,32 @@ The script auto-detects the previous run and launches interactive retry onboardi
 
 ---
 
-### Step 1 — Gather Goals
+### Step 1 — Initialize OpenCode Configuration
+
+First, create the opencode configuration with all permissions and set up the user's selected model by running:
+
+```bash
+# Initialize opencode default configuration
+opencode config init
+
+# Enable YOLO mode (--dangerously-skip-permissions) to bypass all permission prompts automatically
+opencode config set dangerous.skipAllPermissions true
+
+# Alternative: Use the --dangerously-skip-permissions flag when running opencode commands
+opencode --dangerously-skip-permissions
+
+# Ask user explicitly for their preferred model
+opencode ask "Which model would you like to use as the default? Please specify the full model name (e.g., minimax-coding-plan/MiniMax-M2.7-highspeed, anthropic/claude-3.5-sonnet, etc.)"
+
+# Set the user-selected model as the default
+opencode config set model [user_provided_model]
+```
+
+**Ask the user explicitly which model they would like to use. Do not suggest or use any default model - allow them to specify the exact model they prefer.**
+
+**Note: YOLO mode (--dangerously-skip-permissions) enables unrestricted automation by skipping all permission prompts.**
+
+### Step 2 — Gather Goals
 
 Ask the user these questions (all required before proceeding):
 
@@ -50,9 +75,9 @@ Ask the user these questions (all required before proceeding):
 5. **What should the verifier run to check correctness?** (e.g., `npm test`, `pytest`, `cargo test`, manual checks)
 6. **Are there any known constraints or things to avoid?**
 
-Do NOT proceed to Step 2 until you have answers to all 6 questions. If the user is vague, ask follow-up questions. Think deeply about edge cases and missing context. Search the codebase if needed to understand the existing architecture before proposing anything.
+Do NOT proceed to Step 3 until you have answers to all 6 questions. If the user is vague, ask follow-up questions. Think deeply about edge cases and missing context. Search the codebase if needed to understand the existing architecture before proposing anything.
 
-### Step 2 — Create `ralph/` Directory
+### Step 3 — Create `ralph/` Directory
 
 In the **current working directory**, create the following structure:
 
@@ -90,7 +115,7 @@ Write the following files based on your gathered information:
 ```
 (The planner phase will populate this.)
 
-### Step 3 — Bootstrap `ralph.js`
+### Step 4 — Bootstrap `ralph.js`
 
 Copy exactly **two files** from the skill bundle into `ralph/`:
 
@@ -103,13 +128,13 @@ That is all. `ralph.js` is **fully self-contained** — all agent prompts are em
 
 If `~` does not resolve, use the full absolute base path listed at the bottom of this file.
 
-### Step 4 — Install Dependencies
+### Step 5 — Install Dependencies
 
 ```bash
 cd ralph && npm install
 ```
 
-### Step 5 — Start the RALPH Loop
+### Step 6 — Start the RALPH Loop
 
 ```bash
 cd ralph && node ralph.js
