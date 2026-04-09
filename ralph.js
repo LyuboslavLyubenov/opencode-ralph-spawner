@@ -463,31 +463,39 @@ async function streamUntilIdle(client, sessionId, timeoutMs = SESSION_TIMEOUT_MS
         }
       }
 
+      // If the model used the question tool and is waiting on user input,
+      // synthesize a plain-text question immediately so the CLI can continue.
+      let unresolvedQuestionPart = null;
+      for (let mi = messages.length - 1; mi >= 0 && !unresolvedQuestionPart; mi--) {
+        const msgParts = messages[mi].parts || [];
+        for (const p of msgParts) {
+          const isQuestionTool =
+            (p.type === "tool" || p.type === "tool-invocation") &&
+            (p.tool === "question" || p.toolInvocation?.toolName === "question");
+          if (!isQuestionTool) continue;
+
+          const status = p.state?.status ?? p.toolInvocation?.state ?? "";
+          const hasResult = Boolean(p.state?.result ?? p.result ?? p.toolInvocation?.result);
+          const isUnresolved = !hasResult || !status || status === "running" || status === "call" || status === "pending";
+          if (isUnresolved) {
+            unresolvedQuestionPart = p;
+            break;
+          }
+        }
+      }
+
+      if (unresolvedQuestionPart) {
+        questionFallbackText = formatQuestionToolPrompt(unresolvedQuestionPart);
+        if (streamingStarted) process.stdout.write("\n");
+        break;
+      }
+
       // Completion: latest assistant message has step-finish with reason "stop".
       // reason "tool-calls" means this step ended because the model called tools —
       // the agent loop will continue with a new assistant message after the tool results.
       // reason "stop" means the model finished its response with no further tool calls.
       if (lastAssistantIdx >= 0) {
         const lastParts = messages[lastAssistantIdx].parts || [];
-        
-        // Check if there's a pending question tool (waiting for user response)
-        // A question tool that hasn't been answered yet means we should NOT treat the session as complete
-        const hasPendingQuestion = lastParts.some((p) => 
-          (p.type === "tool" || p.type === "tool-invocation") && 
-          (p.tool === "question" || p.toolInvocation?.toolName === "question") &&
-          (!p.state?.result || !p.state?.status || p.state?.status === "running" || p.state?.status === "call")
-        );
-        
-        if (hasPendingQuestion) {
-          const pendingQuestionPart = lastParts.find((p) =>
-            (p.type === "tool" || p.type === "tool-invocation") &&
-            (p.tool === "question" || p.toolInvocation?.toolName === "question")
-          );
-
-          questionFallbackText = formatQuestionToolPrompt(pendingQuestionPart);
-          if (streamingStarted) process.stdout.write("\n");
-          break;
-        }
         
         const stepFinish = lastParts.find((p) => p.type === "step-finish");
         if (stepFinish && stepFinish.reason === "stop") {
