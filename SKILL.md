@@ -41,28 +41,31 @@ The script auto-detects the previous run and launches interactive retry onboardi
 
 ### Step 1 — Initialize OpenCode Configuration
 
-First, create the opencode configuration with all permissions and set up the user's selected model by running:
+First, get the list of available models and ask the user which model they want to use:
 
 ```bash
-# Initialize opencode default configuration
-opencode config init
-
-# Enable YOLO mode (--dangerously-skip-permissions) to bypass all permission prompts automatically
-opencode config set dangerous.skipAllPermissions true
-
-# Alternative: Use the --dangerously-skip-permissions flag when running opencode commands
-opencode --dangerously-skip-permissions
-
-# Ask user explicitly for their preferred model
-opencode ask "Which model would you like to use as the default? Please specify the full model name (e.g., minimax-coding-plan/MiniMax-M2.7-highspeed, anthropic/claude-3.5-sonnet, etc.)"
-
-# Set the user-selected model as the default
-opencode config set model [user_provided_model]
+# Get available models
+opencode models
 ```
 
-**Ask the user explicitly which model they would like to use. Do not suggest or use any default model - allow them to specify the exact model they prefer.**
+**Present the model list to the user and ask them to select one.** Do not suggest or use any default model - allow them to specify from the available options.
 
-**Note: YOLO mode (--dangerously-skip-permissions) enables unrestricted automation by skipping all permission prompts.**
+After the user selects a model, create the `opencode.json` file inside the `ralph/` directory (not a global config) with the selected model:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "user-selected-model-name",
+  "mcp": {
+    "ddg-search": {
+      "type": "local",
+      "command": ["uvx", "duckduckgo-mcp-server"]
+    }
+  }
+}
+```
+
+**Important:** The `opencode.json` must be created inside the `ralph/` directory so that `ralph.js` uses the correct model when spawning OpenCode sessions.
 
 ### Step 2 — Gather Goals
 
@@ -89,6 +92,7 @@ ralph/
 ├── tasks.json          (starts as empty array [])
 ├── plan.md             (starts empty, filled by planner)
 ├── verification-report.md  (starts empty)
+├── opencode.json       (model configuration - create this first!)
 ├── logs/
 └── ralph.js            (the orchestrator — copy from skill)
 ```
@@ -124,7 +128,9 @@ cp ~/.config/opencode/skills/ralph-loop/ralph.js ./ralph/ralph.js
 cp ~/.config/opencode/skills/ralph-loop/package.json.template ./ralph/package.json
 ```
 
-That is all. `ralph.js` is **fully self-contained** — all agent prompts are embedded inside it. The `ralph/` folder has zero dependency on the skill directory after this copy. It can be committed to git, moved to any machine, or run independently as long as Node.js and an OpenCode server are available.
+**Note:** The `opencode.json` file should already exist in `ralph/` from Step 1. If not, create it now with the user's selected model.
+
+`ralph.js` is **fully self-contained** — all agent prompts are embedded inside it. The `ralph/` folder has zero dependency on the skill directory after this copy. It can be committed to git, moved to any machine, or run independently as long as Node.js and an OpenCode server are available.
 
 If `~` does not resolve, use the full absolute base path listed at the bottom of this file.
 
