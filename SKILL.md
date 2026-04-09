@@ -50,7 +50,7 @@ opencode models
 
 **Present the model list to the user and ask them to select one.** Do not suggest or use any default model - allow them to specify from the available options.
 
-After the user selects a model, create the `opencode.json` file inside the `ralph/` directory (not a global config) with the selected model:
+After the user selects a model, create the `opencode.json` file in the **project root** (current working directory, not inside `ralph/`) with the selected model:
 
 ```json
 {
@@ -65,7 +65,7 @@ After the user selects a model, create the `opencode.json` file inside the `ralp
 }
 ```
 
-**Important:** The `opencode.json` must be created inside the `ralph/` directory so that `ralph.js` uses the correct model when spawning OpenCode sessions.
+**Important:** The `opencode.json` must be created in the project root so `opencode serve` picks it up when `ralph.js` starts the server from that directory.
 
 ### Step 2 — Gather Goals
 
@@ -92,7 +92,6 @@ ralph/
 ├── tasks.json          (starts as empty array [])
 ├── plan.md             (starts empty, filled by planner)
 ├── verification-report.md  (starts empty)
-├── opencode.json       (model configuration - create this first!)
 ├── logs/
 └── ralph.js            (the orchestrator — copy from skill)
 ```
@@ -128,7 +127,7 @@ cp ~/.config/opencode/skills/ralph-loop/ralph.js ./ralph/ralph.js
 cp ~/.config/opencode/skills/ralph-loop/package.json.template ./ralph/package.json
 ```
 
-**Note:** The `opencode.json` file should already exist in `ralph/` from Step 1. If not, create it now with the user's selected model.
+**Note:** The `opencode.json` file should already exist in the project root from Step 1. If not, create it now with the user's selected model.
 
 `ralph.js` is **fully self-contained** — all agent prompts are embedded inside it. The `ralph/` folder has zero dependency on the skill directory after this copy. It can be committed to git, moved to any machine, or run independently as long as Node.js and an OpenCode server are available.
 
