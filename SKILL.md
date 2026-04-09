@@ -166,10 +166,10 @@ Phase 0 — RETRY ONBOARDING (auto-triggered when a previous run is detected, or
 
 Phase 1 — PLAN
   Spawns an OpenCode session with the "planner" system prompt.
-  The planner reads goals.md, searches the codebase, and asks clarifying
-  questions when needed using plain assistant text only (no `question` tool).
-  When done, the planner writes plan.md and populates tasks.json.
-  You review and approve before continuing.
+  The planner reads goals.md, searches the codebase, makes reasonable assumptions
+  for any ambiguous decisions (documented in the plan), and writes plan.md + tasks.json.
+  Runs fully non-interactively — no user prompts. A hard timeout (10 min) prevents hangs.
+  Auto-approves and moves to implementation when the planner signals RALPH_PLAN_COMPLETE.
 
 Phase 2 — IMPLEMENT
   For each task in tasks.json (status: "pending"):

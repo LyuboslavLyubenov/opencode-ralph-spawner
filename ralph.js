@@ -38,6 +38,8 @@ const PROJECT_DIR = resolve(RALPH_DIR, "..");
 const MAX_HEAL_CYCLES = 10;
 const POLL_INTERVAL_MS = 2000;
 const SESSION_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes per session
+const ROUND_TIMEOUT_MS = 5 * 60 * 1000;   // 5 minutes per Q&A round — guards against infinite clarification loops
+const PLANNER_MAX_MS = 10 * 60 * 1000;    // 10 minutes hard cap for entire planner phase
 
 const PATHS = {
   goals: join(RALPH_DIR, "goals.md"),
@@ -129,6 +131,7 @@ function isLikelyRepeatedPrompt(previous, current) {
   const b = normalizeForComparison(current);
   if (!a || !b) return false;
   if (a === b) return true;
+  // Strong overlap heuristic for repeated numbered question blocks.
   return a.length > 120 && b.length > 120 && (a.includes(b.slice(0, 140)) || b.includes(a.slice(0, 140)));
 }
 
@@ -227,6 +230,7 @@ async function spawnOpencodeServer() {
   const srv = spawn("opencode", ["serve", "--port", String(port)], {
     stdio: ["ignore", "pipe", "pipe"],
     detached: false,
+    cwd: PROJECT_DIR,
   });
 
   let serverOutput = "";
@@ -280,6 +284,15 @@ function stopOpencodeServer(srv) {
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+async function withTimeout(promise, timeoutMs, errorMessage) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(errorMessage || `timed out after ${timeoutMs}ms`)), timeoutMs)
+    ),
+  ]);
 }
 
 async function waitForIdle(client, sessionId, timeoutMs = SESSION_TIMEOUT_MS, directory = null) {
@@ -389,7 +402,6 @@ async function streamUntilIdle(client, sessionId, timeoutMs = SESSION_TIMEOUT_MS
   // --- streaming state ---
   const announcedTools = new Map(); // tracks printed chars per text part and announced tool calls
   let streamingStarted = false;
-  let questionFallbackText = null;
 
   process.stdout.write(c("dim", "  "));
 
@@ -463,33 +475,6 @@ async function streamUntilIdle(client, sessionId, timeoutMs = SESSION_TIMEOUT_MS
         }
       }
 
-      // If the model used the question tool and is waiting on user input,
-      // synthesize a plain-text question immediately so the CLI can continue.
-      let unresolvedQuestionPart = null;
-      for (let mi = messages.length - 1; mi >= 0 && !unresolvedQuestionPart; mi--) {
-        const msgParts = messages[mi].parts || [];
-        for (const p of msgParts) {
-          const isQuestionTool =
-            (p.type === "tool" || p.type === "tool-invocation") &&
-            (p.tool === "question" || p.toolInvocation?.toolName === "question");
-          if (!isQuestionTool) continue;
-
-          const status = p.state?.status ?? p.toolInvocation?.state ?? "";
-          const hasResult = Boolean(p.state?.result ?? p.result ?? p.toolInvocation?.result);
-          const isUnresolved = !hasResult || !status || status === "running" || status === "call" || status === "pending";
-          if (isUnresolved) {
-            unresolvedQuestionPart = p;
-            break;
-          }
-        }
-      }
-
-      if (unresolvedQuestionPart) {
-        questionFallbackText = formatQuestionToolPrompt(unresolvedQuestionPart);
-        if (streamingStarted) process.stdout.write("\n");
-        break;
-      }
-
       // Completion: latest assistant message has step-finish with reason "stop".
       // reason "tool-calls" means this step ended because the model called tools —
       // the agent loop will continue with a new assistant message after the tool results.
@@ -512,16 +497,16 @@ async function streamUntilIdle(client, sessionId, timeoutMs = SESSION_TIMEOUT_MS
     throw new Error(`Session ${sessionId} timed out after ${timeoutMs / 1000}s`);
   }
 
-  if (questionFallbackText) return questionFallbackText;
   return await getLastAssistantMessage(client, sessionId);
 }
 
 /**
  * Send a message to a session and stream the response live.
  * Returns the assistant's response text.
+ * Throws if the overall operation (prompt + wait) exceeds timeoutMs.
  */
-async function sendMessage(client, sessionId, text, directory) {
-  await client.session.promptAsync({
+async function sendMessage(client, sessionId, text, directory, timeoutMs = SESSION_TIMEOUT_MS) {
+  const sendPromise = client.session.promptAsync({
     path: { id: sessionId },
     query: directory ? { directory } : undefined,
     body: {
@@ -529,7 +514,13 @@ async function sendMessage(client, sessionId, text, directory) {
     },
   });
 
-  return await streamUntilIdle(client, sessionId, SESSION_TIMEOUT_MS, directory);
+  const timeoutPromise = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error(`sendMessage timed out after ${timeoutMs}ms`)), timeoutMs)
+  );
+
+  await Promise.race([sendPromise, timeoutPromise]);
+
+  return await streamUntilIdle(client, sessionId, timeoutMs, directory);
 }
 
 /**
@@ -591,15 +582,11 @@ You will be given:
 3. Search the web if you need knowledge about unfamiliar libraries, APIs, or patterns.
 4. Identify all ambiguities, risks, and unknowns.
 
-### Phase B — Clarification (interactive)
+### Phase B — Assumptions
 
-After research, if there are any unresolved questions, ask the user. Be specific:
-- Do not ask vague questions. Each question must be answerable with a short, specific answer.
-- Do not ask more than 5 questions at once.
-- Do not ask questions whose answers can be inferred from the codebase or goals.
-- After each answer, confirm your understanding before proceeding.
-
-End with: "I have enough information. Let me now produce the plan."
+Do NOT ask questions. Make reasonable, conservative assumptions and document them explicitly in the plan.
+If a decision is ambiguous, pick the safest option (e.g., prefer existing code patterns, minimal changes, stable dependencies).
+Document every assumption as an "Assumed:" bullet in the plan so it is clear what was not guessing about.
 
 ### Phase C — Plan Production
 
@@ -651,9 +638,8 @@ This signals to the orchestrator that the plan is ready for user review.
 - Be ruthlessly specific. Vague tasks produce broken code.
 - Each task description must be self-contained. Do NOT rely on "the previous task" — write out all context.
 - If a task requires touching more than 5 files, split it.
-- If you are uncertain about anything, ask before producing the plan.
-- Ask clarifying questions in NORMAL ASSISTANT TEXT ONLY (plain numbered text).
-- NEVER call a \`question\` tool or any structured prompt UI; the orchestrator only supports plain-text Q&A.
+- Do NOT ask questions. Make assumptions, document them, and proceed.
+- Do NOT read \`/etc/os-release\` for environment detection.
 - Do NOT start implementing. Your only output is \`plan.md\` and \`tasks.json\`.`,
 
   implementer: `# RALPH Loop — Implementer Agent
@@ -678,6 +664,7 @@ You will receive:
 6. **Commit when done.** After all checks pass, commit your changes with a descriptive message. Format: \`feat(ralph): [task-id] short description\`
 7. **Do NOT modify \`ralph/\` files** — except you may append a brief note to \`ralph/logs/\` if needed.
 8. **Do NOT work outside the scope of your task.** If you discover something broken that is outside your task, note it in \`ralph/logs/task-XXX-notes.md\` and leave it.
+9. **Do NOT read \`/etc/os-release\`.** Use other project-safe signals if environment detection is needed.
 
 ## Output When Complete
 
@@ -800,6 +787,7 @@ RALPH_VERIFY_FAIL: [N] failures found
 - Do NOT modify any source files.
 - Do NOT suggest improvements beyond what is strictly required to pass the criteria.
 - Be exact. "It seems to work" is not evidence. Run the command and record the output.
+- Do NOT read \`/etc/os-release\` while verifying.
 - If a verification command is missing (not installed, wrong path), note it as a blocking issue.`,
 };
 
@@ -851,102 +839,74 @@ ${verifyCriteria}
 ## Project Directory
 ${PROJECT_DIR}
 
-Start by reading the codebase, then ask me any clarifying questions you have.
-When you have enough information, write the plan to ralph/plan.md and tasks list to ralph/tasks.json.
+Start by reading the codebase. Make reasonable assumptions for any ambiguous decisions and document them in the plan. Write the plan to ralph/plan.md and tasks list to ralph/tasks.json.
 Signal completion with RALPH_PLAN_COMPLETE on its own line.
 `.trim();
 
-  const { sessionId, firstResponse } = await createSessionWithPrompt(client, {
-    title: "RALPH Planner",
-    systemPrompt: plannerPrompt,
-    userPrompt: initialUserMessage,
-    directory: PROJECT_DIR,
-  });
+  const plannerSession = withTimeout(
+    createSessionWithPrompt(client, {
+      title: "RALPH Planner",
+      systemPrompt: plannerPrompt,
+      userPrompt: initialUserMessage,
+      directory: PROJECT_DIR,
+    }),
+    PLANNER_MAX_MS,
+    `Planner phase timed out after ${PLANNER_MAX_MS / 1000}s`
+  );
 
-  log(`Planner session active. Entering Q&A loop.`, "green");
-  console.log();
-
-  // Interactive Q&A loop
-  let response = firstResponse;
-  let planComplete = false;
-  let lastPlannerResponse = "";
-  let lastUserReply = "";
-  let duplicateRecoveryAttempts = 0;
-
-  while (!planComplete) {
-    if (!response) {
-      log("No response from planner yet. Type 'done' to push it to finish, or wait.", "dim");
-    } else {
-      // Print the planner's response (if not already printed during streaming)
-      const alreadyPrinted = response.includes("I've completed my research") || 
-                             response.includes("I've researched the codebase");
-      if (!alreadyPrinted) {
-        console.log(c("magenta", "\n[Planner]"));
-        console.log(response);
-        console.log();
-      }
-
-      // Check for completion signal
-      if (response.includes("RALPH_PLAN_COMPLETE")) {
-        planComplete = true;
-        log("Planner has completed the plan.", "green");
-        break;
-      }
+  let sessionId, firstResponse;
+  try {
+    ({ sessionId, firstResponse } = await plannerSession);
+  } catch (err) {
+    log(`Planner error: ${err.message}`, "red");
+    log("Attempting to proceed without full plan — will use existing plan.md if present.", "yellow");
+    const existingPlan = safeRead(PATHS.plan);
+    if (!existingPlan) {
+      log("No existing plan found. Cannot proceed.", "red");
+      process.exit(1);
     }
-
-    // Prompt user for reply
-    const userReply = await askUser(
-      "Your reply to the planner (or type 'done' if the planner already has enough info):"
-    );
-
-    if (userReply.toLowerCase() === "done") {
-      // Push the planner to finish
-      response = await sendMessage(
-        client,
-        sessionId,
-        "You have enough information. Please now write ralph/plan.md and ralph/tasks.json, then output RALPH_PLAN_COMPLETE.",
-        PROJECT_DIR
-      );
-    } else {
-      lastUserReply = userReply;
-      response = await sendMessage(client, sessionId, userReply, PROJECT_DIR);
-
-      if (
-        isLikelyRepeatedPrompt(lastPlannerResponse, response) &&
-        duplicateRecoveryAttempts < 2
-      ) {
-        duplicateRecoveryAttempts += 1;
-        log("Planner repeated the same clarification block; sending recovery nudge...", "yellow");
-        response = await sendMessage(
-          client,
-          sessionId,
-          [
-            "You just repeated the same clarification questions.",
-            "Use my previous answer and only ask questions that are still unresolved.",
-            "If everything is resolved, confirm and proceed to write ralph/plan.md and ralph/tasks.json.",
-            "",
-            "Previous answer:",
-            lastUserReply,
-          ].join("\n"),
-          PROJECT_DIR
-        );
-      }
-    }
-
-    lastPlannerResponse = response || lastPlannerResponse;
+    state.phase = "implement";
+    state.planApproved = true;
+    saveState(state);
+    return;
   }
 
-  // Verify plan files were written
-  if (!existsSync(PATHS.plan)) {
-    log("Planner did not write plan.md. Prompting...", "yellow");
+  log(`Planner session active. Running non-interactively — no user Q&A.`, "green");
+  console.log();
+
+  let response = firstResponse;
+
+  if (!response) {
+    log("No response from planner. Waiting for completion...", "dim");
     response = await sendMessage(
       client,
       sessionId,
-      "Please write your plan to ralph/plan.md and your task list to ralph/tasks.json now, then output RALPH_PLAN_COMPLETE.",
-      PROJECT_DIR
+      "Please proceed: write ralph/plan.md and ralph/tasks.json, then output RALPH_PLAN_COMPLETE.",
+      PROJECT_DIR,
+      SESSION_TIMEOUT_MS
+    );
+  }
+
+  console.log(c("magenta", "\n[Planner]"));
+  console.log(response);
+  console.log();
+
+  if (!response.includes("RALPH_PLAN_COMPLETE")) {
+    log("Planner did not signal completion. Sending final nudge...", "yellow");
+    response = await sendMessage(
+      client,
+      sessionId,
+      "Write ralph/plan.md and ralph/tasks.json now, then output RALPH_PLAN_COMPLETE on its own line.",
+      PROJECT_DIR,
+      SESSION_TIMEOUT_MS
     );
     console.log(c("magenta", "\n[Planner]"));
     console.log(response);
+    console.log();
+  }
+
+  if (!response.includes("RALPH_PLAN_COMPLETE")) {
+    log("Planner still has not produced RALPH_PLAN_COMPLETE. Check ralph/plan.md manually.", "red");
   }
 
   const tasks = safeReadJSON(PATHS.tasks, null);
@@ -977,74 +937,11 @@ Signal completion with RALPH_PLAN_COMPLETE on its own line.
   });
   console.log();
 
-  // User approval
-  const approved = await askConfirm("Does this plan look correct? Approve to begin implementation?");
-  if (!approved) {
-    const feedback = await askUser(
-      "What needs to change? (Your feedback will be sent back to the planner)"
-    );
-    log("Returning to planner for revisions...", "yellow");
-
-    // Restart plan phase with feedback
-    state.planFeedback = feedback;
-    // Reopen a new planner session with feedback
-    const revisionSession = await createSessionWithPrompt(client, {
-      title: "RALPH Planner (Revision)",
-      systemPrompt: plannerPrompt,
-      userPrompt: `
-${initialUserMessage}
-
----
-
-PREVIOUS PLAN WAS REJECTED. User feedback:
-${feedback}
-
-Please revise your plan accordingly. Read ralph/plan.md to see what you produced before.
-Then update ralph/plan.md and ralph/tasks.json with the revised plan.
-Output RALPH_PLAN_COMPLETE when done.
-`.trim(),
-      directory: PROJECT_DIR,
-    });
-
-    let revResponse = revisionSession.firstResponse;
-    let revPlanComplete = false;
-    while (!revPlanComplete) {
-      if (!revResponse) {
-        log("No response from planner.", "dim");
-      } else {
-        console.log(c("magenta", "\n[Planner]"));
-        console.log(revResponse);
-        console.log();
-        // Check for completion signal
-        if (revResponse.includes("RALPH_PLAN_COMPLETE")) {
-          revPlanComplete = true;
-          log("Planner has completed the plan.", "green");
-          break;
-        }
-      }
-      const reply = await askUser("Reply (or 'done' to push to completion):");
-      if (reply.toLowerCase() === "done") {
-        revResponse = await sendMessage(
-          client,
-          revisionSession.sessionId,
-          "Finalize the plan now. Write ralph/plan.md and ralph/tasks.json, then output RALPH_PLAN_COMPLETE.",
-          PROJECT_DIR
-        );
-      } else {
-        revResponse = await sendMessage(client, revisionSession.sessionId, reply, PROJECT_DIR);
-      }
-    }
-    try {
-      await client.session.delete({ path: { id: revisionSession.sessionId } });
-    } catch {}
-
-    return runPlanPhase(client, state); // recursive re-review
-  }
-
+  // Auto-approve plan and move to implementation (no user interaction)
   state.phase = "implement";
   state.planApproved = true;
   saveState(state);
-  log("Plan approved. Moving to implementation.", "green");
+  log("Plan ready. Moving to implementation.", "green");
 }
 
 // ---------------------------------------------------------------------------
