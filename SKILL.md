@@ -166,10 +166,10 @@ Phase 0 — RETRY ONBOARDING (auto-triggered when a previous run is detected, or
 
 Phase 1 — PLAN
   Spawns an OpenCode session with the "planner" system prompt.
-  The planner reads goals.md, searches the codebase, and produces
-  an implementation plan without asking questions. It makes reasonable
-  assumptions based on the goals and codebase. When done, the planner
-  writes plan.md and populates tasks.json. You review and approve before continuing.
+  The planner reads goals.md, searches the codebase, and asks clarifying
+  questions when needed using plain assistant text only (no `question` tool).
+  When done, the planner writes plan.md and populates tasks.json.
+  You review and approve before continuing.
 
 Phase 2 — IMPLEMENT
   For each task in tasks.json (status: "pending"):

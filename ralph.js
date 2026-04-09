@@ -116,6 +116,52 @@ function logToFile(filename, content) {
   appendFileSync(path, `\n[${ts}]\n${content}\n`);
 }
 
+function normalizeForComparison(text) {
+  return (text || "")
+    .replace(/```[\s\S]*?```/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function isLikelyRepeatedPrompt(previous, current) {
+  const a = normalizeForComparison(previous);
+  const b = normalizeForComparison(current);
+  if (!a || !b) return false;
+  if (a === b) return true;
+  return a.length > 120 && b.length > 120 && (a.includes(b.slice(0, 140)) || b.includes(a.slice(0, 140)));
+}
+
+function formatQuestionToolPrompt(part) {
+  const input = part?.state?.input ?? part?.toolInvocation?.args ?? part?.args ?? {};
+  const questions = Array.isArray(input.questions) ? input.questions : [];
+  if (questions.length === 0) {
+    return "I need clarification before I can proceed. Please reply with the missing details.";
+  }
+
+  const lines = [
+    "I need clarification before I can proceed:",
+    "",
+  ];
+
+  questions.forEach((q, i) => {
+    lines.push(`${i + 1}. ${q.question || q.header || "Question"}`);
+    const options = Array.isArray(q.options) ? q.options : [];
+    if (options.length > 0) {
+      lines.push("   Options:");
+      options.forEach((opt, j) => {
+        const label = opt?.label || `Option ${j + 1}`;
+        lines.push(`   - ${label}`);
+      });
+    }
+    if (q.multiple) lines.push("   (You may pick multiple options.)");
+    lines.push("");
+  });
+
+  lines.push("Please answer in plain text.");
+  return lines.join("\n").trim();
+}
+
 function loadState() {
   return safeReadJSON(PATHS.state, {
     phase: "plan",
@@ -343,6 +389,7 @@ async function streamUntilIdle(client, sessionId, timeoutMs = SESSION_TIMEOUT_MS
   // --- streaming state ---
   const announcedTools = new Map(); // tracks printed chars per text part and announced tool calls
   let streamingStarted = false;
+  let questionFallbackText = null;
 
   process.stdout.write(c("dim", "  "));
 
@@ -432,10 +479,14 @@ async function streamUntilIdle(client, sessionId, timeoutMs = SESSION_TIMEOUT_MS
         );
         
         if (hasPendingQuestion) {
-          // Session is waiting for user input - but don't return early!
-          // The Q&A loop will detect this and prompt the user for input
-          // Just continue polling so the question stays displayed
-          continue;
+          const pendingQuestionPart = lastParts.find((p) =>
+            (p.type === "tool" || p.type === "tool-invocation") &&
+            (p.tool === "question" || p.toolInvocation?.toolName === "question")
+          );
+
+          questionFallbackText = formatQuestionToolPrompt(pendingQuestionPart);
+          if (streamingStarted) process.stdout.write("\n");
+          break;
         }
         
         const stepFinish = lastParts.find((p) => p.type === "step-finish");
@@ -453,6 +504,7 @@ async function streamUntilIdle(client, sessionId, timeoutMs = SESSION_TIMEOUT_MS
     throw new Error(`Session ${sessionId} timed out after ${timeoutMs / 1000}s`);
   }
 
+  if (questionFallbackText) return questionFallbackText;
   return await getLastAssistantMessage(client, sessionId);
 }
 
@@ -592,6 +644,8 @@ This signals to the orchestrator that the plan is ready for user review.
 - Each task description must be self-contained. Do NOT rely on "the previous task" — write out all context.
 - If a task requires touching more than 5 files, split it.
 - If you are uncertain about anything, ask before producing the plan.
+- Ask clarifying questions in NORMAL ASSISTANT TEXT ONLY (plain numbered text).
+- NEVER call a \`question\` tool or any structured prompt UI; the orchestrator only supports plain-text Q&A.
 - Do NOT start implementing. Your only output is \`plan.md\` and \`tasks.json\`.`,
 
   implementer: `# RALPH Loop — Implementer Agent
@@ -807,6 +861,9 @@ Signal completion with RALPH_PLAN_COMPLETE on its own line.
   // Interactive Q&A loop
   let response = firstResponse;
   let planComplete = false;
+  let lastPlannerResponse = "";
+  let lastUserReply = "";
+  let duplicateRecoveryAttempts = 0;
 
   while (!planComplete) {
     if (!response) {
@@ -843,8 +900,32 @@ Signal completion with RALPH_PLAN_COMPLETE on its own line.
         PROJECT_DIR
       );
     } else {
+      lastUserReply = userReply;
       response = await sendMessage(client, sessionId, userReply, PROJECT_DIR);
+
+      if (
+        isLikelyRepeatedPrompt(lastPlannerResponse, response) &&
+        duplicateRecoveryAttempts < 2
+      ) {
+        duplicateRecoveryAttempts += 1;
+        log("Planner repeated the same clarification block; sending recovery nudge...", "yellow");
+        response = await sendMessage(
+          client,
+          sessionId,
+          [
+            "You just repeated the same clarification questions.",
+            "Use my previous answer and only ask questions that are still unresolved.",
+            "If everything is resolved, confirm and proceed to write ralph/plan.md and ralph/tasks.json.",
+            "",
+            "Previous answer:",
+            lastUserReply,
+          ].join("\n"),
+          PROJECT_DIR
+        );
+      }
     }
+
+    lastPlannerResponse = response || lastPlannerResponse;
   }
 
   // Verify plan files were written
