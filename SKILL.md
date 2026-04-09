@@ -17,7 +17,9 @@ This skill is invoked by any agent (OpenCode, Claude Code, Cursor, etc.) from an
 
 ## When This Skill Is Invoked
 
-When asked to "run RALPH", "start the ralph loop", or "use ralph to build X", follow these exact steps:
+When asked to "run RALPH", "start the ralph loop", or "use ralph to build X", follow these exact steps.
+
+**Working Directory Rule:** All work happens in the folder that contains the `ralph/` subdirectory (the parent of `ralph/`). Never navigate upward out of this directory. The `ralph/` folder sits inside your project root, and every operation — file creation, `npm install`, running tests, etc. — must stay within the project root.
 
 ### Step 0 — Detect Existing RALPH Loop
 
@@ -50,7 +52,7 @@ opencode models
 
 **Present the model list to the user and ask them to select one.** Do not suggest or use any default model - allow them to specify from the available options.
 
-After the user selects a model, create the `opencode.json` file in the **project root** (current working directory, not inside `ralph/`) with the selected model:
+After the user selects a model, create the `opencode.json` file in the **project root** (the parent directory of `ralph/`, not inside `ralph/` itself) with the selected model:
 
 ```json
 {
@@ -73,7 +75,7 @@ Ask the user these questions (all required before proceeding):
 
 1. **What is the primary task/feature to build?** (1–3 sentence description)
 2. **What are the success criteria?** (How will we know it's done? List 3–10 acceptance criteria)
-3. **What is the target directory?** (Where is the codebase? Default: current working directory)
+3. **What is the project root?** (Where is the codebase? This is the folder that will contain the `ralph/` subdirectory. Default: current working directory)
 4. **What tech stack / constraints apply?** (Languages, frameworks, test commands, lint commands)
 5. **What should the verifier run to check correctness?** (e.g., `npm test`, `pytest`, `cargo test`, manual checks)
 6. **Are there any known constraints or things to avoid?**
@@ -82,7 +84,7 @@ Do NOT proceed to Step 3 until you have answers to all 6 questions. If the user 
 
 ### Step 3 — Create `ralph/` Directory
 
-In the **current working directory**, create the following structure:
+In the **project root** (the parent directory where all work happens), create the following structure:
 
 ```
 ralph/
@@ -138,12 +140,14 @@ If `~` does not resolve, use the full absolute base path listed at the bottom of
 ```bash
 cd ralph && npm install
 ```
+(Still running from the project root — the `cd ralph` is relative to it.)
 
 ### Step 6 — Start the RALPH Loop
 
 ```bash
 cd ralph && node ralph.js
 ```
+(Still running from the project root — the `cd ralph` is relative to it.)
 
 This will run interactively in the terminal. The RALPH orchestrator takes over from here. It automatically spawns an OpenCode server on a free port and shuts it down when the loop finishes or is interrupted — no manual `opencode serve` step is needed.
 
@@ -204,6 +208,7 @@ Phase 4 — HEAL (if failures exist)
 - If the loop is interrupted, you can resume by running `node ralph/ralph.js --resume`
 - If the user wants to retry with updated criteria, run `node ralph/ralph.js --retry`
 - The `opencode` binary must be in your PATH — the script spawns its own server automatically on a free port; **you do not need to start OpenCode manually**
+- **Never navigate upward out of the project root.** All file operations, commands, and agent sessions operate within the project root directory (the parent of `ralph/`).
 
 ---
 
