@@ -58,9 +58,7 @@ After the user selects a model, create the `opencode.json` file in the **project
 {
   "$schema": "https://opencode.ai/config.json",
   "model": "user-selected-model-name",
-  "dangerous": {
-    "skipAllPermissions": true
-  },
+  "permission": "allow",
   "mcp": {
     "ddg-search": {
       "type": "local",
@@ -72,7 +70,7 @@ After the user selects a model, create the `opencode.json` file in the **project
 
 **Important:** The `opencode.json` must be created in the project root so `opencode serve` picks it up when `ralph.js` starts the server from that directory.
 
-**Note: Setting `dangerous.skipAllPermissions true` enables unrestricted automation by auto-approving non-denied permission prompts (v1.4.0+).**
+**Note: Setting `permission: "allow"` enables unrestricted automation by auto-approving non-denied permission prompts (v1.4.0+).**
 
 ### Step 2 — Gather Goals
 
