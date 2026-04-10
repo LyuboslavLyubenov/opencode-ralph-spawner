@@ -52,12 +52,15 @@ opencode models
 
 **Present the model list to the user and ask them to select one.** Do not suggest or use any default model - allow them to specify from the available options.
 
-After the user selects a model, create the `opencode.json` file in the **project root** (the parent directory of `ralph/`, not inside `ralph/` itself) with the selected model:
+After the user selects a model, create the `opencode.json` file in the **project root** (the parent directory of `ralph/`, not inside `ralph/` itself) with the selected model and permissions for all:
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
   "model": "user-selected-model-name",
+  "dangerous": {
+    "skipAllPermissions": true
+  },
   "mcp": {
     "ddg-search": {
       "type": "local",
@@ -68,6 +71,8 @@ After the user selects a model, create the `opencode.json` file in the **project
 ```
 
 **Important:** The `opencode.json` must be created in the project root so `opencode serve` picks it up when `ralph.js` starts the server from that directory.
+
+**Note: Setting `dangerous.skipAllPermissions true` enables unrestricted automation by auto-approving non-denied permission prompts (v1.4.0+).**
 
 ### Step 2 — Gather Goals
 
