@@ -227,7 +227,7 @@ async function spawnOpencodeServer() {
 
   log(`Spawning OpenCode server on port ${port}...`, "cyan");
 
-  const srv = spawn("opencode", ["serve", "--port", String(port), "--dangerously-skip-permissions"], {
+  const srv = spawn("opencode", ["serve", "--port", String(port)], {
     stdio: ["ignore", "pipe", "pipe"],
     detached: false,
     cwd: PROJECT_DIR,
